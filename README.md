@@ -1,6 +1,6 @@
 # Mihrab packages
 
-The apt and dnf repositories for [Mihrab](https://github.com/MihrabHQ/Mihrab)
+The apt, dnf and pacman repositories for [Mihrab](https://github.com/MihrabHQ/Mihrab)
 on Linux, served at **https://mihrabhq.github.io/packages**, and the publisher
 of the AUR package `mihrab-bin`.
 
