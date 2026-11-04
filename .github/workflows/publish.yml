@@ -120,7 +120,11 @@ jobs:
       - id: deploy
         uses: actions/deploy-pages@v4
 
+      # Never fails the run: the repositories above are already live, and an
+      # AUR that refuses the key (an account not yet made, registration
+      # closed) is caught up by running this workflow by hand with "force".
       - name: The AUR package
+        continue-on-error: true
         env:
           AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
           VERSION: ${{ needs.check.outputs.version }}
@@ -130,7 +134,8 @@ jobs:
           printf '%s\n' "$AUR_SSH_KEY" > ~/.ssh/aur && chmod 600 ~/.ssh/aur
           ssh-keyscan -t ed25519 aur.archlinux.org >> ~/.ssh/known_hosts 2>/dev/null
           export GIT_SSH_COMMAND="ssh -i ~/.ssh/aur -o IdentitiesOnly=yes"
-          git clone ssh://aur@aur.archlinux.org/mihrab-bin.git aur
+          git clone ssh://aur@aur.archlinux.org/mihrab-bin.git aur ||
+            { echo "::warning::The AUR refused the key (is the account made and the key added?): mihrab-bin not updated."; exit 1; }
           sh mihrab/desktop/packaging/aur/make-pkgbuild.sh "$VERSION" in/Mihrab-*-amd64.deb in/Mihrab-*-arm64.deb aur
           cp mihrab/desktop/packaging/aur/LICENSE aur/LICENSE
           cd aur
