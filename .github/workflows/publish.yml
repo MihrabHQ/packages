@@ -1,0 +1,140 @@
+name: Publish
+
+# The apt and dnf repositories at https://mihrabhq.github.io/packages, and the
+# AUR package mihrab-bin, kept on the latest Mihrab release that carries the
+# Windows and Linux app.
+#
+# Every hour it asks MihrabHQ/Mihrab for its latest release (not the
+# desktop-preview pre-release). When that release has the .deb and .rpm files
+# and its version is not the one served, it builds both repositories with the
+# release's own scripts (desktop/packaging/ at that tag), signs them with
+# PACKAGES_SIGNING_KEY, deploys them to Pages, and — when AUR_SSH_KEY is
+# set — pushes the new PKGBUILD to the AUR. Run it by hand to publish now
+# (tick "force" to rebuild a version already served).
+#
+# Secrets (Settings → Secrets → Actions), set by desktop/packaging/make-keys.sh:
+#   PACKAGES_SIGNING_KEY  the armoured secret key that signs both repositories
+#   AUR_SSH_KEY           the private SSH key of the AUR account (optional)
+
+on:
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Rebuild even if this version is already served'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+  actions: write
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+env:
+  SOURCE: MihrabHQ/Mihrab
+  SITE: https://mihrabhq.github.io/packages
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      go: ${{ steps.check.outputs.go }}
+      tag: ${{ steps.check.outputs.tag }}
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      # A scheduled workflow in a quiet repository is switched off after 60
+      # days; re-enabling it on every run keeps the hourly check alive.
+      - name: Keep the schedule alive
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/publish.yml/enable" || true
+
+      - name: Is there something new?
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=$(gh release view -R "$SOURCE" --json tagName --jq .tagName)
+          assets=$(gh release view "$tag" -R "$SOURCE" --json assets --jq '[.assets[].name | select(test("^Mihrab-.*\\.(deb|rpm)$"))] | length')
+          version=${tag#v}
+          served=$(curl -fsS "$SITE/version.txt" 2>/dev/null || true)
+          echo "latest $tag, $assets deb/rpm files; served: ${served:-nothing}"
+          if [ "$assets" -lt 4 ]; then
+            echo "The latest release has no Linux packages yet (DESKTOP_RELEASE off?): nothing to publish."
+            echo "go=false" >> "$GITHUB_OUTPUT"
+          elif [ "$served" = "$version" ] && [ "${{ inputs.force }}" != "true" ]; then
+            echo "$version is already served."
+            echo "go=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "go=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  # Only when there is something to publish, so the hourly check leaves no
+  # Pages deployment behind.
+  publish:
+    needs: check
+    if: needs.check.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE }}
+          ref: ${{ needs.check.outputs.tag }}
+          sparse-checkout: desktop/packaging
+          path: mihrab
+
+      - name: Build the repositories
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SIGNING_KEY: ${{ secrets.PACKAGES_SIGNING_KEY }}
+          TAG: ${{ needs.check.outputs.tag }}
+        run: |
+          [ -n "$SIGNING_KEY" ] || { echo "PACKAGES_SIGNING_KEY is not set"; exit 1; }
+          sudo apt-get install -yq apt-utils createrepo-c rpm >/dev/null
+          export GNUPGHOME="$RUNNER_TEMP/gpg"; mkdir -m700 "$GNUPGHOME"
+          printf '%s\n' "$SIGNING_KEY" | gpg --batch --import
+          mkdir in
+          gh release download "$TAG" -R "$SOURCE" -D in -p 'Mihrab-*.deb' -p 'Mihrab-*.rpm'
+          ls -la in
+          MIHRAB_REPO_URL="$SITE" sh mihrab/desktop/packaging/build-repos.sh in site
+          sed "s/@VERSION@/$(cat site/version.txt)/g" mihrab/desktop/packaging/site/index.html > site/index.html
+          touch site/.nojekyll
+          du -sh site
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - id: deploy
+        uses: actions/deploy-pages@v4
+
+      - name: The AUR package
+        env:
+          AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          if [ -z "$AUR_SSH_KEY" ]; then echo "AUR_SSH_KEY is not set: the AUR is left as it is."; exit 0; fi
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$AUR_SSH_KEY" > ~/.ssh/aur && chmod 600 ~/.ssh/aur
+          ssh-keyscan -t ed25519 aur.archlinux.org >> ~/.ssh/known_hosts 2>/dev/null
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/aur -o IdentitiesOnly=yes"
+          git clone ssh://aur@aur.archlinux.org/mihrab-bin.git aur
+          sh mihrab/desktop/packaging/aur/make-pkgbuild.sh "$VERSION" in/Mihrab-*-amd64.deb in/Mihrab-*-arm64.deb aur
+          cp mihrab/desktop/packaging/aur/LICENSE aur/LICENSE
+          cd aur
+          git add PKGBUILD .SRCINFO LICENSE
+          if git diff --cached --quiet; then echo "the AUR already has $VERSION"; exit 0; fi
+          git -c user.name="Hassan El Ghamri" -c user.email=hassan15015099@gmail.com commit -q -m "Mihrab $VERSION"
+          git push origin HEAD:master
